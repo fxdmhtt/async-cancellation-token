@@ -3,8 +3,8 @@
 [![Crates.io](https://img.shields.io/crates/v/async-cancellation-token)](https://crates.io/crates/async-cancellation-token)
 [![Docs](https://docs.rs/async-cancellation-token/badge.svg)](https://docs.rs/async-cancellation-token)
 
-`async-cancellation-token` is a lightweight Rust library that provides **cancellation tokens** for cooperative cancellation of asynchronous tasks and callbacks.  
-It works in `!no_std` environments with `alloc`, and is designed to integrate seamlessly with Rust `Future`s and `async/await`.
+`async-cancellation-token` is a lightweight **single-threaded** Rust library that provides **cancellation tokens** for cooperative cancellation of asynchronous tasks and callbacks.  
+It is designed for `!Send` / single-threaded async environments (e.g., `futures::executor::LocalPool`).
 
 ## Features
 
@@ -12,7 +12,9 @@ It works in `!no_std` environments with `alloc`, and is designed to integrate se
 - Generate `CancellationToken`s to be passed to tasks.
 - Async-aware: `token.cancelled().await` completes when the token is cancelled.
 - Supports registering callbacks that execute on cancellation.
-- Fully `Clone`able and `Send`/`Sync` friendly in `Rc`/`Arc` contexts.
+- Fully `Clone`able and works with `Rc`/`Cell`/`RefCell`.
+
+> ⚠️ This crate is **not thread-safe**. Use only in single-threaded async contexts.
 
 ## Installation
 
