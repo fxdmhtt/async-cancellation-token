@@ -1,3 +1,49 @@
+//! # async-cancellation-token
+//!
+//! `async-cancellation-token` is a lightweight **single-threaded** Rust library that provides
+//! **cancellation tokens** for cooperative cancellation of asynchronous tasks and callbacks.
+//!
+//! This crate works in single-threaded async environments (e.g., `futures::executor::LocalPool`)
+//! and uses `Rc`, `Cell`, and `RefCell` internally. It is **not thread-safe**.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use std::time::Duration;
+//! use async_cancellation_token::CancellationTokenSource;
+//! use futures::{FutureExt, executor::LocalPool, pin_mut, select, task::LocalSpawnExt};
+//! use futures_timer::Delay;
+//!
+//! let cts = CancellationTokenSource::new();
+//! let token = cts.token();
+//!
+//! let mut pool = LocalPool::new();
+//! let spawner = pool.spawner();
+//!
+//! spawner.spawn_local(async move {
+//!     for i in 1..=5 {
+//!         let delay = Delay::new(Duration::from_millis(100)).fuse();
+//!         let cancelled = token.cancelled().fuse();
+//!         pin_mut!(delay, cancelled);
+//!
+//!         select! {
+//!             _ = delay => println!("Step {i}"),
+//!             _ = cancelled => {
+//!                 println!("Cancelled!");
+//!                 break;
+//!             }
+//!         }
+//!     }
+//! }.map(|_| ())).unwrap();
+//!
+//! spawner.spawn_local(async move {
+//!     Delay::new(Duration::from_millis(250)).await;
+//!     cts.cancel();
+//! }.map(|_| ())).unwrap();
+//!
+//! pool.run();
+//! ```
+
 use std::{
     cell::{Cell, RefCell},
     future::Future,
@@ -6,23 +52,62 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+/// Inner shared state for `CancellationToken` and `CancellationTokenSource`.
 #[derive(Default)]
 struct Inner {
+    /// Whether the token has been cancelled.
     cancelled: Cell<bool>,
+    /// List of wakers to wake when cancellation occurs.
     wakers: RefCell<Vec<Waker>>,
+    /// List of callbacks to call when cancellation occurs.
     callbacks: RefCell<Vec<Box<dyn FnOnce()>>>,
 }
 
+/// A source that can cancel associated `CancellationToken`s.
+///
+/// # Example
+///
+/// ```rust
+/// use async_cancellation_token::CancellationTokenSource;
+///
+/// let cts = CancellationTokenSource::new();
+/// let token = cts.token();
+///
+/// assert!(!cts.is_cancelled());
+/// cts.cancel();
+/// assert!(cts.is_cancelled());
+/// ```
 #[derive(Clone)]
 pub struct CancellationTokenSource {
     inner: Rc<Inner>,
 }
 
+/// A token that can be checked for cancellation or awaited.
+///
+/// # Example
+///
+/// ```rust
+/// use async_cancellation_token::CancellationTokenSource;
+/// use futures::{FutureExt, executor::LocalPool, task::LocalSpawnExt};
+///
+/// let cts = CancellationTokenSource::new();
+/// let token = cts.token();
+///
+/// let mut pool = LocalPool::new();
+/// pool.spawner().spawn_local(async move {
+///     token.cancelled().await;
+///     println!("Cancelled!");
+/// }.map(|_| ())).unwrap();
+///
+/// cts.cancel();
+/// pool.run();
+/// ```
 #[derive(Clone)]
 pub struct CancellationToken {
     inner: Rc<Inner>,
 }
 
+/// Error returned when a cancelled token is checked synchronously.
 #[derive(Debug)]
 pub struct Cancelled;
 
@@ -33,40 +118,50 @@ impl Default for CancellationTokenSource {
 }
 
 impl CancellationTokenSource {
+    /// Create a new `CancellationTokenSource`.
     pub fn new() -> Self {
         Self {
             inner: Rc::new(Inner::default()),
         }
     }
 
+    /// Get a `CancellationToken` associated with this source.
     pub fn token(&self) -> CancellationToken {
         CancellationToken {
             inner: self.inner.clone(),
         }
     }
 
+    /// Cancel all associated tokens.
+    ///
+    /// This triggers any registered callbacks and wakes all wakers.
     pub fn cancel(&self) {
         if !self.inner.cancelled.replace(true) {
+            // Call all registered callbacks
             for cb in self.inner.callbacks.borrow_mut().drain(..) {
                 cb();
             }
 
+            // Wake all tasks waiting for cancellation
             for w in self.inner.wakers.borrow_mut().drain(..) {
                 w.wake();
             }
         }
     }
 
+    /// Check if this source has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.get()
     }
 }
 
 impl CancellationToken {
+    /// Check if the token has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.get()
     }
 
+    /// Synchronously check cancellation and return `Err(Cancelled)` if cancelled.
     pub fn check_cancelled(&self) -> Result<(), Cancelled> {
         if self.is_cancelled() {
             Err(Cancelled)
@@ -75,12 +170,55 @@ impl CancellationToken {
         }
     }
 
+    /// Returns a `Future` that completes when the token is cancelled.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_cancellation_token::CancellationTokenSource;
+    /// use futures::{FutureExt, executor::LocalPool, task::LocalSpawnExt};
+    ///
+    /// let cts = CancellationTokenSource::new();
+    /// let token = cts.token();
+    ///
+    /// let mut pool = LocalPool::new();
+    /// pool.spawner().spawn_local(async move {
+    ///     token.cancelled().await;
+    ///     println!("Cancelled!");
+    /// }.map(|_| ())).unwrap();
+    ///
+    /// cts.cancel();
+    /// pool.run();
+    /// ```
     pub fn cancelled(&self) -> CancelledFuture {
         CancelledFuture {
             token: self.clone(),
         }
     }
 
+    /// Register a callback to run when the token is cancelled.
+    ///
+    /// If the token is already cancelled, the callback is called immediately.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::{cell::Cell, rc::Rc};
+    /// use async_cancellation_token::CancellationTokenSource;
+    ///
+    /// let cts = CancellationTokenSource::new();
+    /// let token = cts.token();
+    ///
+    /// let flag = Rc::new(Cell::new(false));
+    /// let flag_clone = Rc::clone(&flag);
+    ///
+    /// token.register(move || {
+    ///     flag_clone.set(true);
+    /// });
+    ///
+    /// cts.cancel();
+    /// assert!(flag.get());
+    /// ```
     pub fn register(&self, f: impl FnOnce() + 'static) {
         if self.is_cancelled() {
             f();
@@ -90,6 +228,7 @@ impl CancellationToken {
     }
 }
 
+/// Future that completes when a `CancellationToken` is cancelled.
 pub struct CancelledFuture {
     token: CancellationToken,
 }
