@@ -46,6 +46,8 @@
 
 use std::{
     cell::{Cell, RefCell},
+    error::Error,
+    fmt::Display,
     future::Future,
     pin::Pin,
     rc::Rc,
@@ -108,8 +110,16 @@ pub struct CancellationToken {
 }
 
 /// Error returned when a cancelled token is checked synchronously.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct Cancelled;
+
+impl Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled by CancellationTokenSource")
+    }
+}
+
+impl Error for Cancelled {}
 
 impl Default for CancellationTokenSource {
     fn default() -> Self {

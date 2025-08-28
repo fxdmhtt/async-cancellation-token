@@ -1,6 +1,6 @@
 [package]
 name = "async-cancellation-token"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Junkang Yuan <yuanjunkang@gmail.com>"]
 description = "A lightweight single-threaded Rust library for cancellation tokens, enabling cooperative cancellation of asynchronous tasks and callbacks."
