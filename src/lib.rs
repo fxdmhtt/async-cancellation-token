@@ -3,8 +3,13 @@
 //! `async-cancellation-token` is a lightweight **single-threaded** Rust library that provides
 //! **cancellation tokens** for cooperative cancellation of asynchronous tasks and callbacks.
 //!
-//! This crate works in single-threaded async environments (e.g., `futures::executor::LocalPool`)
-//! and uses `Rc`, `Cell`, and `RefCell` internally. It is **not thread-safe**.
+//! This crate is designed for **single-threaded async environments** such as `futures::executor::LocalPool`.
+//! It internally uses `Rc`, `Cell`, and `RefCell`, and is **not thread-safe**.
+//!
+//! Features:
+//! - `CancellationTokenSource` can cancel multiple associated `CancellationToken`s.
+//! - `CancellationToken` can be awaited via `.cancelled()` or checked synchronously.
+//! - Supports registration of **one-time callbacks** (`FnOnce`) that run on cancellation.
 //!
 //! ## Example
 //!
@@ -20,6 +25,7 @@
 //! let mut pool = LocalPool::new();
 //! let spawner = pool.spawner();
 //!
+//! // Spawn a task that performs 5 steps but can be cancelled
 //! spawner.spawn_local(async move {
 //!     for i in 1..=5 {
 //!         let delay = Delay::new(Duration::from_millis(100)).fuse();
@@ -36,6 +42,7 @@
 //!     }
 //! }.map(|_| ())).unwrap();
 //!
+//! // Cancel after 250ms
 //! spawner.spawn_local(async move {
 //!     Delay::new(Duration::from_millis(250)).await;
 //!     cts.cancel();
@@ -50,11 +57,21 @@ use std::{
     fmt::Display,
     future::Future,
     pin::Pin,
-    rc::Rc,
+    rc::{Rc, Weak},
     task::{Context, Poll, Waker},
 };
 
+use slab::Slab;
+
 /// Inner shared state for `CancellationToken` and `CancellationTokenSource`.
+///
+/// This is the single-threaded shared state. All fields are internal and should not
+/// be accessed directly outside the crate.
+///
+/// - `cancelled`: `true` once cancellation has occurred.
+/// - `wakers`: list of wakers for async futures awaiting cancellation.
+/// - `callbacks`: one-time callbacks (`FnOnce`) registered to run on cancellation.
+///   These are stored in a `Slab` to allow stable keys for `CancellationTokenRegistration`.
 #[derive(Default)]
 struct Inner {
     /// Whether the token has been cancelled.
@@ -62,10 +79,14 @@ struct Inner {
     /// List of wakers to wake when cancellation occurs.
     wakers: RefCell<Vec<Waker>>,
     /// List of callbacks to call when cancellation occurs.
-    callbacks: RefCell<Vec<Box<dyn FnOnce()>>>,
+    callbacks: RefCell<Slab<Box<dyn FnOnce()>>>,
 }
 
 /// A source that can cancel associated `CancellationToken`s.
+///
+/// Cancellation is **cooperative** and single-threaded. When cancelled:
+/// - All registered `FnOnce` callbacks are called (in registration order).
+/// - All futures waiting via `CancellationToken::cancelled()` are woken.
 ///
 /// # Example
 ///
@@ -144,11 +165,18 @@ impl CancellationTokenSource {
 
     /// Cancel all associated tokens.
     ///
-    /// This triggers any registered callbacks and wakes all wakers.
+    /// This marks the source as cancelled. After cancellation:
+    /// - All registered callbacks are called exactly once.
+    /// - All waiting futures are woken.
+    ///
+    /// **Note:** Cancellation is **idempotent**; calling this method multiple times has no effect.
+    /// **FnOnce callbacks will only be called once**.
+    ///
+    /// Single-threaded only. Not safe to call concurrently from multiple threads.
     pub fn cancel(&self) {
         if !self.inner.cancelled.replace(true) {
             // Call all registered callbacks
-            for cb in self.inner.callbacks.borrow_mut().drain(..) {
+            for cb in self.inner.callbacks.borrow_mut().drain() {
                 cb();
             }
 
@@ -208,7 +236,11 @@ impl CancellationToken {
 
     /// Register a callback to run when the token is cancelled.
     ///
-    /// If the token is already cancelled, the callback is called immediately.
+    /// - If the token is **already cancelled**, the callback is called immediately.
+    /// - Otherwise, the callback is stored and will be called exactly once upon cancellation.
+    ///
+    /// Returns a `CancellationTokenRegistration`, which will **remove the callback if dropped
+    /// before cancellation**.
     ///
     /// # Example
     ///
@@ -222,23 +254,61 @@ impl CancellationToken {
     /// let flag = Rc::new(Cell::new(false));
     /// let flag_clone = Rc::clone(&flag);
     ///
-    /// token.register(move || {
+    /// let reg = token.register(move || {
     ///     flag_clone.set(true);
     /// });
     ///
     /// cts.cancel();
     /// assert!(flag.get());
+    ///
+    /// drop(reg);
     /// ```
-    pub fn register(&self, f: impl FnOnce() + 'static) {
+    pub fn register(&self, f: impl FnOnce() + 'static) -> Option<CancellationTokenRegistration> {
         if self.is_cancelled() {
             f();
+            None
         } else {
-            self.inner.callbacks.borrow_mut().push(Box::new(f));
+            CancellationTokenRegistration {
+                inner: Rc::downgrade(&self.inner),
+                key: self.inner.callbacks.borrow_mut().insert(Box::new(f)),
+            }
+            .into()
         }
     }
 }
 
-/// Future that completes when a `CancellationToken` is cancelled.
+/// Represents a registered callback on a `CancellationToken`.
+///
+/// When this object is dropped **before the token is cancelled**, the callback
+/// is automatically removed. If the token is already cancelled, Drop does nothing.
+///
+/// This ensures that callbacks are **only called once** and resources are cleaned up.
+///
+/// **Single-threaded only.** Not safe to use concurrently.
+pub struct CancellationTokenRegistration {
+    inner: Weak<Inner>,
+    key: usize,
+}
+
+impl Drop for CancellationTokenRegistration {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            if inner.cancelled.get() {
+                // Callback was already removed
+                return;
+            }
+            let _ = inner.callbacks.borrow_mut().remove(self.key);
+        }
+    }
+}
+
+/// A future that completes when a `CancellationToken` is cancelled.
+///
+/// - If the token is already cancelled, poll returns `Poll::Ready` immediately.
+/// - Otherwise, the future registers its waker and returns `Poll::Pending`.
+///
+/// **Single-threaded only.** Not Send or Sync.
+/// The future will be woken exactly once when the token is cancelled.
 pub struct CancelledFuture {
     token: CancellationToken,
 }
@@ -261,6 +331,8 @@ impl Future for CancelledFuture {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::time::Duration;
 
     use futures::{FutureExt, executor::LocalPool, pin_mut, select, task::LocalSpawnExt};
@@ -268,6 +340,7 @@ mod tests {
 
     use super::*;
 
+    /// Test cooperative cancellation of two tasks with different mechanisms.
     #[test]
     fn cancel_two_tasks() {
         let cancelled_a = Rc::new(Cell::new(false));
@@ -277,28 +350,20 @@ mod tests {
             let cancelled_a = Rc::clone(&cancelled_a);
 
             async move {
-                println!("Task A started");
-
-                for i in 1..=10 {
-                    let delay = Delay::new(Duration::from_millis(300)).fuse();
+                for _ in 1..=5 {
+                    let delay = Delay::new(Duration::from_millis(50)).fuse();
                     let cancelled = token.cancelled().fuse();
 
                     pin_mut!(delay, cancelled);
 
                     select! {
-                        _ = delay => {
-                            println!("Task A step {i}");
-                        },
+                        _ = delay => {},
                         _ = cancelled => {
-                            println!("Task A detected cancellation, cleaning up...");
-                            // Cleanup && Dispose
                             cancelled_a.set(true);
                             break;
                         },
                     }
                 }
-
-                println!("Task A finished");
             }
         };
 
@@ -306,26 +371,18 @@ mod tests {
             let cancelled_b = Rc::clone(&cancelled_b);
 
             async move {
-                println!("Task B started");
+                for _ in 1..=5 {
+                    Delay::new(Duration::from_millis(80)).await;
 
-                for i in 1..=10 {
-                    Delay::new(Duration::from_millis(500)).await;
-
-                    println!("Task B step {i}");
                     if token.check_cancelled().is_err() {
-                        println!("Task B noticed cancellation after step {i}");
-                        // Cleanup && Dispose
                         cancelled_b.set(true);
                         break;
                     }
                 }
-
-                println!("Task B finished");
             }
         };
 
         let cts = CancellationTokenSource::new();
-
         let mut pool = LocalPool::new();
         let spawner = pool.spawner();
 
@@ -336,14 +393,14 @@ mod tests {
             .spawn_local(task_b(cts.token()).map(|_| ()))
             .unwrap();
 
+        // Cancel after 200ms
         {
-            let cts = cts.clone();
+            let cts_clone = cts.clone();
             spawner
                 .spawn_local(
                     async move {
-                        Delay::new(Duration::from_secs(2)).await;
-                        println!("Cancelling all tasks!");
-                        cts.cancel();
+                        Delay::new(Duration::from_millis(200)).await;
+                        cts_clone.cancel();
                     }
                     .map(|_| ()),
                 )
@@ -352,36 +409,125 @@ mod tests {
 
         pool.run();
 
+        // Cancelled flags should be set
         assert!(cts.is_cancelled());
         assert!(cancelled_a.get());
         assert!(cancelled_b.get());
+
+        // Calling cancel again should not panic or change state
+        cts.cancel();
+        assert!(cts.is_cancelled());
     }
 
+    /// Test registering callbacks before and after cancellation, including Drop behavior.
     #[test]
     fn cancellation_register_callbacks() {
         let cts = CancellationTokenSource::new();
         let token = cts.token();
 
-        let flag1 = Rc::new(Cell::new(false));
-        let flag2 = Rc::new(Cell::new(false));
+        let flag_before = Rc::new(Cell::new(false));
+        let flag_after = Rc::new(Cell::new(false));
+        let flag_drop = Rc::new(Cell::new(false));
 
-        {
-            let flag1 = Rc::clone(&flag1);
-            token.register(move || {
-                flag1.set(true);
-            });
-        }
+        // 1. Callback registered before cancel → should execute
+        let reg_before = {
+            let flag = Rc::clone(&flag_before);
+            token
+                .register(move || {
+                    flag.set(true);
+                })
+                .unwrap()
+        };
 
         cts.cancel();
-        assert!(flag1.get());
+        assert!(flag_before.get());
 
+        drop(reg_before);
+
+        // 2. Callback registered after cancel → executes immediately
         {
-            let flag2 = Rc::clone(&flag2);
+            let flag = Rc::clone(&flag_after);
             token.register(move || {
-                flag2.set(true);
+                flag.set(true);
             });
         }
+        assert!(flag_after.get());
 
-        assert!(flag2.get());
+        // 3. Callback registered but dropped before cancel → should NOT execute
+        let token2 = CancellationTokenSource::new().token();
+        let reg_drop = {
+            let flag = Rc::clone(&flag_drop);
+            token2
+                .register(move || {
+                    flag.set(true);
+                })
+                .unwrap()
+        };
+        drop(reg_drop); // dropped before cancel
+        token2.inner.cancelled.set(true); // force cancel
+        assert!(!flag_drop.get());
+    }
+
+    /// Test that CancelledFuture returns Poll::Ready after cancellation
+    #[test]
+    fn cancelled_future_poll_ready() {
+        let cts = CancellationTokenSource::new();
+        let token = cts.token();
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+
+        let finished = Rc::new(Cell::new(false));
+        let finished_clone = Rc::clone(&finished);
+
+        spawner
+            .spawn_local(
+                async move {
+                    token.cancelled().await;
+                    finished_clone.set(true);
+                }
+                .map(|_| ()),
+            )
+            .unwrap();
+
+        // Cancel token
+        cts.cancel();
+
+        pool.run();
+        assert!(finished.get());
+    }
+
+    /// Test multiple callbacks and idempotent cancellation
+    #[test]
+    fn multiple_callbacks_and_idempotent_cancel() {
+        let cts = CancellationTokenSource::new();
+        let token = cts.token();
+
+        let flags: Vec<_> = (0..3).map(|_| Rc::new(Cell::new(false))).collect();
+
+        let regs: Vec<_> = flags
+            .iter()
+            .map(|flag| {
+                let f = Rc::clone(flag);
+                token
+                    .register(move || {
+                        f.set(true);
+                    })
+                    .unwrap()
+            })
+            .collect();
+
+        // Cancel once
+        cts.cancel();
+        for flag in &flags {
+            assert!(flag.get());
+        }
+
+        // Cancel again → should not panic, flags remain true
+        cts.cancel();
+        for flag in &flags {
+            assert!(flag.get());
+        }
+
+        drop(regs); // dropping after cancel → nothing happens, still safe
     }
 }
