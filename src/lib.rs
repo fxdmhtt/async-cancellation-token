@@ -100,7 +100,7 @@ struct Inner {
 /// cts.cancel();
 /// assert!(cts.is_cancelled());
 /// ```
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct CancellationTokenSource {
     inner: Rc<Inner>,
 }
@@ -142,18 +142,10 @@ impl Display for Cancelled {
 
 impl Error for Cancelled {}
 
-impl Default for CancellationTokenSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CancellationTokenSource {
     /// Create a new `CancellationTokenSource`.
     pub fn new() -> Self {
-        Self {
-            inner: Rc::new(Inner::default()),
-        }
+        Default::default()
     }
 
     /// Get a `CancellationToken` associated with this source.
