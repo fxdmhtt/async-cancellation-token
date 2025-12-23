@@ -54,7 +54,7 @@
 use std::{
     cell::{Cell, RefCell},
     error::Error,
-    fmt::Display,
+    fmt::{Debug, Display},
     future::Future,
     pin::Pin,
     rc::{Rc, Weak},
@@ -82,6 +82,16 @@ struct Inner {
     callbacks: RefCell<Slab<Box<dyn FnOnce()>>>,
 }
 
+impl Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("cancelled", &self.cancelled)
+            .field("wakers.len", &self.wakers.borrow().len())
+            .field("callbacks.len", &self.callbacks.borrow().len())
+            .finish()
+    }
+}
+
 /// A source that can cancel associated `CancellationToken`s.
 ///
 /// Cancellation is **cooperative** and single-threaded. When cancelled:
@@ -100,7 +110,7 @@ struct Inner {
 /// cts.cancel();
 /// assert!(cts.is_cancelled());
 /// ```
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct CancellationTokenSource {
     inner: Rc<Inner>,
 }
@@ -125,13 +135,13 @@ pub struct CancellationTokenSource {
 /// cts.cancel();
 /// pool.run();
 /// ```
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CancellationToken {
     inner: Rc<Inner>,
 }
 
 /// Error returned when a cancelled token is checked synchronously.
-#[derive(Copy, Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
+#[derive(Debug, Copy, Clone, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct Cancelled;
 
 impl Display for Cancelled {
@@ -277,6 +287,7 @@ impl CancellationToken {
 /// This ensures that callbacks are **only called once** and resources are cleaned up.
 ///
 /// **Single-threaded only.** Not safe to use concurrently.
+#[derive(Debug)]
 pub struct CancellationTokenRegistration {
     inner: Weak<Inner>,
     key: usize,
@@ -301,6 +312,7 @@ impl Drop for CancellationTokenRegistration {
 ///
 /// **Single-threaded only.** Not Send or Sync.
 /// The future will be woken exactly once when the token is cancelled.
+#[derive(Debug)]
 pub struct CancelledFuture {
     token: CancellationToken,
 }
